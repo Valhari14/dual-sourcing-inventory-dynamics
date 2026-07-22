@@ -1,0 +1,4 @@
+sphinx-rtd-theme
+sphinxcontrib-youtube
+sphinxcontrib-video
+idinn @ git+https://gitlab.com/ComputationalScience/inventory-optimization.git@main

@@ -1,0 +1,11 @@
+idinn==0.2.0a0
+graphviz
+matplotlib
+numba>=0.57
+numpy>=2.0
+pandas>=2.0
+plotly
+streamlit
+tensorboard>=2.12
+torch>=2.5
+torchview

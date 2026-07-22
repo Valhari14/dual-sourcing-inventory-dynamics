@@ -1,0 +1,50 @@
+[project]
+name = "idinn"
+description = "Inventory dynamics–informed neural networks and other related controllers for solving single-sourcing and dual-sourcing problems."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Jiawei Li", email = "sud.concept0x@icloud.com" },
+  { name = "Thomas Asikis", email = "thomas.asikis@uzh.ch" },
+  { name = "Ioannis Fragkos", email = "fragkos@rsm.nl" },
+  { name = "Lucas Boettcher", email = "l.boettcher@fs.de" },
+]
+keywords = ["neural networks", "dynamic control"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "numba>=0.57",
+  "numpy>=2.0",
+  "matplotlib>=3.7.1",
+  "tensorboard>=2.12",
+  "torch>=2.5"
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://gitlab.com/ComputationalScience/idinn"
+Documentation = "https://inventory-optimization.readthedocs.io"
+Issues = "https://gitlab.com/ComputationalScience/idinn/-/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/idinn/__init__.py"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.29.5",
+    "pytest>=8.3.4",
+    "sphinx-rtd-theme>=3.0.2",
+    "sphinx>=7.1.2",
+    "sphinxcontrib-youtube>=1.4.1",
+    "sphinxcontrib-video>=0.4.1",
+    "esbonio>=0.16.5",
+    "mypy>=1.14.1",
+]

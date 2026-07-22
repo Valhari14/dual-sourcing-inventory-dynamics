@@ -1,0 +1,47 @@
+services:
+  juplab:
+    build:
+      context: .
+      target: base
+    entrypoint: scripts/jupyter.sh
+    ports:
+      - "8888:8888"
+    volumes:
+      - .:/opt/project/
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+  tests:
+    build:
+      context: .
+      target: base
+    entrypoint: scripts/tests.sh
+    volumes:
+      - .:/opt/project/
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
+  app:
+    build:
+      context: .
+      target: app
+    entrypoint: scripts/app.sh
+    ports:
+      - "8501:8501"
+    volumes:
+      - .:/opt/project/
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [ gpu ]
