@@ -2,7 +2,7 @@
 run_dp_bound.py
 
 Runs the cycle-unrolled DP dual-sourcing controller (either the vanilla
-serial implementation in dynamic_programming.py, or the parallel one in
+serial implementation in dp_bound.py, or the parallel one in
 dp_bound_parallel.py) for a single parameter combination and saves results
 to a JSON file.
 
@@ -10,28 +10,13 @@ Use --controller to pick which implementation runs. Run the SAME
 parameters through both --controller serial and --controller parallel to
 validate the parallel version before trusting it for a full sweep.
 
-Usage example (small validation combo, serial):
-    python run_dp_bound.py \
-        --controller serial \
-        --cycle_length 1 \
-        --backlog_cost 50 \
-        --holding_cost 5 \
-        --expedited_order_cost 10 \
-        --regular_lead_time 2 \
-        --expedited_lead_time 0 \
-        --regular_order_cost 0 \
-        --demand_min 0 \
-        --demand_max 2 \
-        --bound_slack 1 \
-        --max_iterations 5000 \
-        --tolerance 1e-6 \
-        --sourcing_periods 200 \
-        --seed 42 \
-        --output_path results/dp_bound/validation/serial_quick.json \
-        --save_qf
-
-Same command with --controller parallel and a different --output_path
-gives you the matching parallel run to diff against.
+Checkpointing (parallel controller only): pass --checkpoint_path to save
+the value function periodically during the sweep. If the process
+receives SIGTERM (e.g. from Slurm's --signal warning before a time-limit
+kill), it saves a checkpoint and exits with code 75 instead of writing an
+incomplete output JSON. Re-running the same command will resume from
+that checkpoint rather than starting over. On successful convergence the
+checkpoint file is deleted automatically.
 """
 
 import argparse
@@ -39,6 +24,7 @@ import json
 import logging
 import os
 import pickle
+import sys
 import time
 from datetime import datetime
 
@@ -48,19 +34,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+INTERRUPTED_EXIT_CODE = 75
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run DP dual-sourcing (dp_bound) experiment")
 
     parser.add_argument(
         "--controller", choices=["serial", "parallel"], default="parallel",
-        help="serial -> dynamic_programming.DynamicProgrammingController (vanilla), "
+        help="serial -> dp_bound.DynamicProgrammingController (vanilla), "
              "parallel -> dp_bound_parallel.DynamicProgrammingController",
     )
 
     # Model parameters
     parser.add_argument("--cycle_length", type=int, default=2)
-    
     parser.add_argument("--backlog_cost", type=float, default=495.0)
     parser.add_argument("--holding_cost", type=float, default=5.0)
     parser.add_argument("--expedited_order_cost", type=float, default=20.0)
@@ -80,6 +67,14 @@ def parse_args():
         help="1 = base signed IP box, 2 = widened box for truncation-sensitivity re-run "
              "(matching values between 1 and 2 certify the truncation is non-binding).",
     )
+
+    # Checkpointing (parallel controller only)
+    parser.add_argument(
+        "--checkpoint_path", type=str, default=None,
+        help="Path to save/resume the value-function checkpoint (parallel controller only). "
+             "If not given but --output_path is, a default is derived automatically.",
+    )
+    parser.add_argument("--checkpoint_freq", type=int, default=200)
 
     # Evaluation parameters
     parser.add_argument("--sourcing_periods", type=int, default=1000)
@@ -115,6 +110,10 @@ def main():
 
     os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
 
+    checkpoint_path = args.checkpoint_path
+    if checkpoint_path is None and args.controller == "parallel":
+        checkpoint_path = args.output_path.replace(".json", "_ckpt.npz")
+
     demand = UniformDemand(low=args.demand_min, high=args.demand_max)
 
     model = DualSourcingModel(
@@ -134,7 +133,7 @@ def main():
     logger.info(f"Starting DP fit ({args.controller})...")
     t0 = time.time()
 
-    controller.fit(
+    fit_kwargs = dict(
         sourcing_model=model,
         max_iterations=args.max_iterations,
         tolerance=args.tolerance,
@@ -142,8 +141,22 @@ def main():
         log_freq=args.log_freq,
         bound_slack=args.bound_slack,
     )
+    if args.controller == "parallel":
+        fit_kwargs["checkpoint_path"] = checkpoint_path
+        fit_kwargs["checkpoint_freq"] = args.checkpoint_freq
+
+    controller.fit(**fit_kwargs)
 
     fit_duration = time.time() - t0
+
+    if getattr(controller, "interrupted", False):
+        logger.warning(
+            f"Fit was interrupted before convergence after {fit_duration:.1f}s "
+            f"-- checkpoint saved to {checkpoint_path}. No output JSON written. "
+            f"Re-run the same command to resume."
+        )
+        sys.exit(INTERRUPTED_EXIT_CODE)
+
     logger.info(f"DP fit completed in {fit_duration:.1f}s ({fit_duration/3600:.2f}h)")
 
     logger.info("Evaluating average cost...")

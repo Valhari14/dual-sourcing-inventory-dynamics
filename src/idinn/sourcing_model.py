@@ -142,15 +142,24 @@ class SingleSourcingModel(BaseSourcingModel):
         if self.lead_time is None:
             raise ValueError("`lead_time` is not set")
 
+        # Single source of truth for the device all state lives on
+        _dev = self.past_inventories.device
+
+        # Ensure q is on the correct device
+        if not isinstance(q, torch.Tensor):
+            q = torch.tensor([[q]], device=_dev)
+        else:
+            q = q.to(_dev)
+
         # Current orders are added to past_orders
         self.past_orders = torch.cat([self.past_orders, q], dim=1)
         # Past orders arrived, if past orders are not available, then arrived order is 0
         if self.past_orders.shape[1] >= 1 + self.lead_time:
             arrived_order = self.past_orders[:, [-1 - self.lead_time]]
         else:
-            arrived_order = torch.zeros(self.batch_size, 1)
-        # Generate current demand
-        current_demand = self.demand_generator.sample(self.batch_size)
+            arrived_order = torch.zeros(self.batch_size, 1, device=_dev)
+        # Generate current demand (always on _dev)
+        current_demand = self.demand_generator.sample(self.batch_size).to(_dev)
         # Current demand are added to past_demands
         self.past_demands = torch.cat([self.past_demands, current_demand], dim=1)
         # Update inventory
@@ -278,10 +287,20 @@ class DualSourcingModel(BaseSourcingModel):
         if self.expedited_lead_time is None:
             raise ValueError("`expedited_lead_time` is not set")
 
+        # Single source of truth for the device all state lives on.
+        # reset() always allocates on CPU; after the move-list in get_total_cost
+        # this becomes cuda:0 when training/eval is on GPU.
+        _dev = self.past_inventories.device
+
+        # Ensure order tensors land on the correct device
         if not isinstance(regular_q, torch.Tensor):
-            regular_q = torch.tensor([[regular_q]])
+            regular_q = torch.tensor([[regular_q]], device=_dev)
+        else:
+            regular_q = regular_q.to(_dev)
         if not isinstance(expedited_q, torch.Tensor):
-            expedited_q = torch.tensor([[expedited_q]])
+            expedited_q = torch.tensor([[expedited_q]], device=_dev)
+        else:
+            expedited_q = expedited_q.to(_dev)
 
         # Current regular order are added to past_regular_orders
         self.past_regular_orders = torch.cat(
@@ -298,7 +317,7 @@ class DualSourcingModel(BaseSourcingModel):
                 :, [-1 - self.regular_lead_time]
             ]
         else:
-            arrived_regular_orders = torch.zeros(self.batch_size, 1)
+            arrived_regular_orders = torch.zeros(self.batch_size, 1, device=_dev)
         # Past expedited orders arrived,
         # if past expedited orders are not available, then arrived order is 0
         if self.past_expedited_orders.shape[1] >= 1 + self.expedited_lead_time:
@@ -306,9 +325,9 @@ class DualSourcingModel(BaseSourcingModel):
                 :, [-1 - self.expedited_lead_time]
             ]
         else:
-            arrived_expedited_orders = torch.zeros(self.batch_size, 1)
-        # Generate current demand
-        current_demand = self.demand_generator.sample(self.batch_size)
+            arrived_expedited_orders = torch.zeros(self.batch_size, 1, device=_dev)
+        # Generate current demand and move to same device immediately
+        current_demand = self.demand_generator.sample(self.batch_size).to(_dev)
         # Current demand are added to past_demands
         self.past_demands = torch.cat([self.past_demands, current_demand], dim=1)
         # Update inventory
