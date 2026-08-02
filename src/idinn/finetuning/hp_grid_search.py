@@ -1,29 +1,7 @@
 """
 hp_grid_search.py  --  Hyperparameter grid search for CyclicDualNeuralController
 Three modes: scan (6-combo grid), full (single combo + seed_train), infer (GAP%).
-Device-agnostic: --device cpu | cuda.  Paper-correct: RMSprop, no scheduler, no grad-clip.
-
-Usage (run from repo root):
-  # Step 0a: CPU smoke test (2 epochs)
-  python src/idinn/finetuning/hp_grid_search.py --mode scan --lt_s 2 --n_cycles 2 --shortage_cost 495 --epochs 2 --checkpoint_dir models/smoke_cpu --device cpu
-
-  # Step 0b: GPU smoke test (same config, --device cuda)
-  python src/idinn/finetuning/hp_grid_search.py --mode scan --lt_s 2 --n_cycles 2 --shortage_cost 495 --epochs 2 --checkpoint_dir models/smoke_gpu --device cuda
-
-  # Step 1: Scan row (2,1) on GPU - 800 epochs
-  python src/idinn/finetuning/hp_grid_search.py --mode scan --lt_s 2 --n_cycles 2 --shortage_cost 495 --epochs 800 --checkpoint_dir models/hp_grid/scan_row21 --device cuda
-
-  # Step 2: Full run row (2,1) after picking winner from scan (example: lr=3e-3, paper layers)
-  python src/idinn/finetuning/hp_grid_search.py --mode full --lt_s 2 --n_cycles 2 --shortage_cost 495 --parameters_lr 3e-3 --hidden_layers "128,64,32,16,8,4,2" --epochs 5500 --n_seeds 150 --checkpoint_dir models/hp_grid/full_row21 --device cuda
-
-  # Step 3: Infer GAP% for row (2,1)
-  python src/idinn/finetuning/hp_grid_search.py --mode infer --lt_s 2 --n_cycles 2 --shortage_cost 495 --vf 68.0055 --checkpoint_dir models/hp_grid/full_row21
-
-  # Row (2,6): lt_s=3, n_cycles=2, b=95 -- uses sourcing_periods=150 automatically
-  python src/idinn/finetuning/hp_grid_search.py --mode scan --lt_s 3 --n_cycles 2 --shortage_cost 95 --epochs 800 --checkpoint_dir models/hp_grid/scan_row26 --device cuda
-
-  # Row (3,2): lt_s=2, n_cycles=3, b=95
-  python src/idinn/finetuning/hp_grid_search.py --mode scan --lt_s 2 --n_cycles 3 --shortage_cost 95 --epochs 800 --checkpoint_dir models/hp_grid/scan_row32 --device cuda
+Device-agnostic: --device cpu | cuda. RMSprop, no scheduler, no grad-clip.
 """
 
 import argparse
@@ -214,7 +192,7 @@ def run_scan(args):
 
 
 # ---------------------------------------------------------------------------
-# Parallel seed worker  (TOP-LEVEL — must be picklable for multiprocessing)
+# Parallel seed worker  
 # ---------------------------------------------------------------------------
 
 def _seed_worker(worker_cfg: dict) -> dict:
