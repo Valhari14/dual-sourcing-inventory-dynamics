@@ -103,7 +103,7 @@ python src/idinn/finetuning/hp_grid_search.py \
     --checkpoint_dir models/t2_c3_d4_b95_ls3 \
     --device cuda
 
-# 4. Evaluation and Certified Optimality GAP% (500 Monte Carlo seeds)
+# 4. Evaluation and GAP% (500 Monte Carlo seeds)
 python src/idinn/finetuning/hp_grid_search.py \
     --mode infer \
     --n_cycles 3 --lt_s 2 --shortage_cost 495 --demand_high 4 \
