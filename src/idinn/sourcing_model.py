@@ -203,15 +203,9 @@ class DualSourcingModel(BaseSourcingModel):
         init_inventory : float
             The initial inventory.
         batch_size : int, default is 1
-            The batch size for orders.
-        demand : Iterable, torch.Tensor, np.array, or pd.Series, optional
-            The array for outputting values of demands.
-        demand_distribution : str, default is `uniform`.
-            Distribution for generated demand when `demand` is not specified.
-        demand_low : int, default is 1.
-            Lower bound for generated demand when `demand` is not specified.
-        demand_high : int, default is 4.
-            Higher bound for generated demand when `demand` is not specified.
+            The batch size for simulation trajectories.
+        demand_generator : Union[UniformDemand, CustomDemand]
+            Stochastic demand generator for period demand draws.
         """
         super().__init__(
             regular_lead_time=regular_lead_time,

@@ -14,27 +14,23 @@ logger = logging.getLogger()
 
 class CyclicDualNeuralController(torch.nn.Module, BaseNeuralController):
     """
-    Implements a multi-period nerual network architecture. Input consists of periodic time states
-    E.g. I_t, I_(t+n), I_(t+2n)....
-    Demand is realized internally for the whole cycle
-    Cost calculation is based on the whole cycle
+    Implements a multi-period neural network architecture for cyclic dual-sourcing.
+    The network receives the pipeline state and determines order quantities for the entire cycle.
     """
 
     def __init__(
         self, 
-        hidden_layers: List[int] = [128, 64, 32, 16, 8,4],
+        hidden_layers: List[int] = [64, 32, 16, 8, 4],
         activation: torch.nn.Module = torch.nn.CELU(alpha=1.0),
-        n_cycles: int = 2
-        ) -> None:
-
+        n_cycles: int = 2,
+    ) -> None:
         """
         Parameters
         ----------
-        hidden_layers: Architecure of hidden layers. hidden_layer[n] represents the number of nerons in layer n.
-        activation: Activations betweeen layers
-        n_cycles: Defines the number of time periods in 1 cycle. The output heads (and accordingly, the forward pass) will enumerate based on this value.
+        hidden_layers: Architecture of hidden layers. hidden_layers[n] represents neurons in layer n.
+        activation: Activation function between hidden layers.
+        n_cycles: Number of periods in one replenishment cycle (output heads = n_cycles + 1).
         """
-        
         super().__init__()
 
         self.hidden_layers = hidden_layers
@@ -117,7 +113,8 @@ class CyclicDualNeuralController(torch.nn.Module, BaseNeuralController):
             raise AttributeError("Model not initialized. Call `init_layers()` first.")
 
         h = self.model(inputs)
-        #h = torch.clamp(h, min=0.0, max=20.0)
+        # Prevent runaway order explosion into thousands of units (max single-period demand is <= 8)
+        h = torch.clamp(h, min=0.0, max=40.0)
         q = h - torch.frac(h).detach()  # straight-through estimator
 
         # index 0: regular_q for period 0; indices 1..n_cycles: expedited_q per period
@@ -131,23 +128,23 @@ class CyclicDualNeuralController(torch.nn.Module, BaseNeuralController):
         output_tensor: bool = False,
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[int, int]]:
         """
-        Predict order qunatities from the neural network.
+        Predict replenishment order quantities from the neural network.
 
         Parameters
         ----------
         current_inventory : int, or torch.Tensor
-            Current inventory.
+            Current inventory level.
         past_regular_orders : list, or torch.Tensor, optional
-            Past regular orders. If the length of `past_regular_orders` is lower than `regular_lead_time`, it will be padded with zeros. If the length of `past_regular_orders` is higher than `regular_lead_time`, only the last `regular_lead_time` orders will be used during inference.
+            Past regular orders. Padded or sliced to regular_lead_time.
         past_expedited_orders : list, or torch.Tensor, optional
-            Past expedited orders. If the length of `past_expedited_orders` is lower than `expedited_lead_time`, it will be padded with zeros. If the length of `past_expedited_orders` is higher than `expedited_lead_time`, only the last `expedited_lead_time` orders will be used during inference.
+            Past expedited orders. Padded or sliced to expedited_lead_time.
         output_tensor : bool, default is False
-            If True, the replenishment order quantity will be returned as a torch.Tensor. Otherwise, it will be returned as an integer.
+            If True, order quantities are returned as torch.Tensor; otherwise as integers.
 
         Returns
         -------
         tuple
-            A tuple containing the regular order quantity, expedited order quantity at time t, and expeditied order quantity at time t+1.
+            Tuple of (regular_order, expedited_order_0, expedited_order_1, ...).
         """
         if self.sourcing_model is None:
             raise AttributeError("The controller is not trained.")
@@ -179,59 +176,59 @@ class CyclicDualNeuralController(torch.nn.Module, BaseNeuralController):
         parameters_lr: float = 1e-4,
         seed: Optional[int] = None,
         checkpoint_path: Optional[str] = None,
-        # ----------------------------------------------------------------
-        # Optional hyperparameter controls (Option A).
-        # Defaults reproduce the colleague's original behaviour exactly so
-        # pre_training.py / finetuning1.py continue to work unchanged.
-        # Set optimizer_type='rmsprop', use_scheduler=False,
-        # use_grad_clip=False to match the paper's setup.
-        # ----------------------------------------------------------------
-        optimizer_type: str = 'adam',      # 'adam' | 'rmsprop'
-        use_scheduler: bool = True,        # cosine-annealing LR decay
+        optimizer_type: str = 'rmsprop',   # 'rmsprop' (Böttcher et al.) | 'adam'
+        use_scheduler: bool = False,       # optional LR decay
         use_grad_clip: bool = True,        # clip grad norm to 1.0
-        device: str = 'cpu',              # 'cpu' | 'cuda'
+        device: str = 'cpu',               # 'cpu' | 'cuda'
+        patience: int = 0,                 # early-stop: 0 = disabled
+        target_vf: Optional[float] = None,
+        vf_gap_tol: float = 0.005,
+        vf_patience: int = 5,
     ) -> None:
         """
-        Train the neural network controller using the sourcing model and specified parameters.
+        Train the neural network controller using the sourcing model environment.
 
         Parameters
         ----------
         sourcing_model : DualSourcingModel
-            The sourcing model for training.
+            The sourcing model environment for training.
         sourcing_periods : int
-            Number of sourcing periods for training.
+            Number of sourcing periods per training epoch.
         epochs : int
             Number of training epochs.
-        validation_sourcing_periods : int, optional
-            Number of sourcing periods for validation.
-        validation_freq : int, default is 50
-            Only relevant if `validation_sourcing_periods` is provided. Specifies how
-            many training epochs to run before a new validation run is performed.
-        log_freq : int, default is 10
-            Specifies how many training epochs to run before logging the training cost.
-        init_inventory_freq : int, default is 4
-            Specifies how many parameter updating epochs to run before initial inventory
-            is updated.
-        init_inventory_lr : float, default is 1e-1
-            Learning rate for initial inventory.
-        parameters_lr : float, default is 1e-4
-            Learning rate for updating neural network parameters.
+        validation_sourcing_periods : int, default 1000
+            Number of sourcing periods for validation rollouts.
+        validation_freq : int, default 50
+            Interval of training epochs between validation evaluations.
+        log_freq : int, default 10
+            Interval of training epochs between logging.
+        init_inventory_freq : int, default 4
+            Interval of parameter epochs between initial inventory updates.
+        init_inventory_lr : float, default 1e-1
+            Learning rate for initial inventory parameter.
+        parameters_lr : float, default 1e-4
+            Learning rate for neural network weights.
         seed : int, optional
             Random seed for reproducibility.
         checkpoint_path : str, optional
-            If provided, the best checkpoint (by validation cost) is saved here.
-        optimizer_type : str, default 'adam'
-            Which optimizer to use for NN parameters: 'adam' or 'rmsprop'.
-            'rmsprop' matches the paper (Bottcher et al.) with alpha=0.99, eps=1e-8.
-        use_scheduler : bool, default True
-            If True, apply CosineAnnealingLR decay on top of the NN-parameters
-            optimizer (colleague's addition).  Set False to match the paper.
+            If provided, saves the best model checkpoint based on validation cost.
+        optimizer_type : str, default 'rmsprop'
+            Optimizer type: 'rmsprop' (Böttcher et al., alpha=0.99, eps=1e-8) or 'adam'.
+        use_scheduler : bool, default False
+            If True, applies CosineAnnealingLR decay.
         use_grad_clip : bool, default True
-            If True, clip gradient norm to 1.0 before each step (colleague's
-            addition).  Set False to match the paper.
+            If True, clips gradient norm to 1.0 to stabilize training on longer cycles.
         device : str, default 'cpu'
-            Torch device string ('cpu' or 'cuda').  The model and all tensors
-            produced during training are moved to this device.
+            Computation device ('cpu' or 'cuda').
+        patience : int, default 0
+            Patience for early stopping based on validation cost. If > 0, stops
+            if validation cost does not improve for `patience` checks.
+        target_vf : float, optional
+            Certified DP value-function baseline for VF-aware early stopping.
+        vf_gap_tol : float, default 0.005
+            Relative distance to target_vf counting as within tolerance (0.005 = 0.5%).
+        vf_patience : int, default 5
+            Consecutive validation checks required within vf_gap_tol to trigger early stop.
         """
 
         assert optimizer_type in ('adam', 'rmsprop'), \
@@ -246,18 +243,6 @@ class CyclicDualNeuralController(torch.nn.Module, BaseNeuralController):
         self.to(_device)
         sourcing_model.init_inventory.data = sourcing_model.init_inventory.data.to(_device)
 
-        def _move_sm_to_device(sm, dev):
-            """
-            Move all state tensors of the sourcing model to `dev`.
-            Called after every sm.reset() because reset() always allocates
-            tensors on CPU regardless of the target device.
-            """
-            for attr in ('past_inventories', 'past_demands',
-                         'past_regular_orders', 'past_expedited_orders',
-                         'past_orders'):
-                if hasattr(sm, attr):
-                    setattr(sm, attr, getattr(sm, attr).to(dev))
-
         # Store sourcing model in self.sourcing_model
         self.sourcing_model = sourcing_model
 
@@ -269,6 +254,7 @@ class CyclicDualNeuralController(torch.nn.Module, BaseNeuralController):
                 regular_lead_time=sourcing_model.get_regular_lead_time(),
                 expedited_lead_time=sourcing_model.get_expedited_lead_time(),
             )
+            self.to(_device)
 
         start_time = datetime.now()
         logger.info(
@@ -302,7 +288,7 @@ class CyclicDualNeuralController(torch.nn.Module, BaseNeuralController):
                 self.parameters(), lr=parameters_lr, alpha=0.99, eps=1e-8
             )
         else:
-            # Colleague's original setup
+            # Alternative Adam optimizer
             optimizer_parameters = torch.optim.Adam(
                 self.parameters(), lr=parameters_lr
             )
@@ -311,26 +297,39 @@ class CyclicDualNeuralController(torch.nn.Module, BaseNeuralController):
         scheduler = None
         if use_scheduler:
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer_parameters, T_max=epochs, eta_min=1e-5
+                optimizer_parameters, T_max=epochs, eta_min=5e-5
             )
 
         min_loss = np.inf
         best_state = None   # will be set on first validation pass
-        N_VAL_SEEDS = 10    # deterministic multi-seed validation
+        best_init_inventory = None
+        N_VAL_SEEDS = 100   # 100-seed validation — much better proxy for EVAL_SEEDS=500
+        no_improve_count = 0  # for early stopping
+        vf_streak = 0          # consecutive validation checks within vf_gap_tol of target_vf
 
         for epoch in tqdm(range(epochs)):
 
             optimizer_init_inventory.zero_grad()
             optimizer_parameters.zero_grad()
-            sourcing_model.reset()
-            _move_sm_to_device(sourcing_model, _device)  # reset() puts tensors on CPU
+            # get_total_cost handles reset and device placement internally
             train_loss = self.get_total_cost(sourcing_model, sourcing_periods)
+
+            # NaN/Inf guard — stop immediately, don't waste more compute
+            if not torch.isfinite(train_loss):
+                tqdm.write(f"NaN/Inf training loss at epoch {epoch} — seed diverged, stopping early.")
+                logger.warning("Diverged at epoch %d (train_loss=%s) — aborting seed.", epoch, train_loss.item())
+                break
+
             train_loss.backward()
 
             if use_grad_clip:
                 torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+                if sourcing_model.init_inventory.grad is not None:
+                    torch.nn.utils.clip_grad_norm_([sourcing_model.init_inventory], max_norm=1.0)
 
             optimizer_init_inventory.step()
+            # Prevent initial inventory from drifting to runaway negative or huge positive values
+            sourcing_model.init_inventory.data.clamp_(min=0.0, max=30.0)
             optimizer_parameters.step()
 
             if scheduler is not None:
@@ -342,42 +341,116 @@ class CyclicDualNeuralController(torch.nn.Module, BaseNeuralController):
                 with torch.no_grad():
                     val_losses = []
                     for s in range(N_VAL_SEEDS):
-                        sourcing_model.reset()
-                        _move_sm_to_device(sourcing_model, _device)
+                        # get_total_cost handles reset and device placement internally
                         val_losses.append(
                             self.get_total_cost(sourcing_model, validation_sourcing_periods, seed=s)
                         )
                 eval_loss = torch.stack(val_losses).mean()
+                val_avg = (eval_loss / validation_sourcing_periods).item()
                 logger.info(
                     f"Epoch {epoch}/{epochs}"
-                    f" - Validation cost: {eval_loss / validation_sourcing_periods:.4f}"
+                    f" - Validation cost: {val_avg:.4f}"
                 )
-                if eval_loss < min_loss:
+                improved = eval_loss < min_loss
+                if improved:
                     min_loss = eval_loss
                     best_state = {k: v.cpu() for k, v in self.state_dict().items()}
+                    best_init_inventory = sourcing_model.init_inventory.item()
+                    no_improve_count = 0
+                    # Save immediately — checkpoint always reflects the best found so far
+                    self.save_checkpoint(checkpoint_path, init_inventory=best_init_inventory)
+                else:
+                    no_improve_count += 1
+
+                # ---- VF-aware stopping -------------------------------------------
+                # best_val = (min_loss / periods) is monotonically non-increasing.
+                # vf_streak counts consecutive checks where best_val is within
+                # vf_gap_tol of VF AND the model did NOT improve this check.
+                # This fires only when the model has both converged AND is near VF.
+                if target_vf is not None:
+                    best_val = (min_loss / validation_sourcing_periods).item()
+                    gap = abs(best_val - target_vf) / abs(target_vf)
+                    in_tol = gap <= vf_gap_tol
+                    if in_tol and not improved:
+                        vf_streak += 1   # stable inside VF tolerance → count toward stop
+                    else:
+                        vf_streak = 0    # not in tolerance yet, or still improving within it
+
+                    if vf_streak >= vf_patience:
+                        msg = (
+                            f"VF-aware early stop at epoch {epoch}: "
+                            f"best_val={best_val:.4f} within {vf_gap_tol*100:.1f}% "
+                            f"of VF={target_vf:.4f} (GAP={gap*100:+.2f}%) "
+                            f"— converged, stable for {vf_streak} checks."
+                        )
+                        tqdm.write(msg)
+                        logger.info(msg)
+                        break
+
+                # ---- Patience (plateau) stopping ---------------------------------
+                # Fires when validation has not improved for `patience` checks.
+                # Case 1 (far from VF): bad local minimum — log warning.
+                # Case 2 (near VF): VF-aware stop should have fired first if
+                #   vf_patience < patience; otherwise this fires instead.
+                if patience > 0 and no_improve_count >= patience:
+                    best_val_final = (min_loss / validation_sourcing_periods).item()
+                    if target_vf is not None:
+                        gap_pct = (best_val_final - target_vf) / abs(target_vf) * 100
+                        if abs(gap_pct) <= vf_gap_tol * 100:
+                            verdict = f"near VF (GAP={gap_pct:+.2f}%)"
+                            logger.info(
+                                "Patience stop (near VF) epoch=%d best_val=%.4f "
+                                "VF=%.4f GAP=%.2f%%",
+                                epoch, best_val_final, target_vf, gap_pct,
+                            )
+                        else:
+                            verdict = (
+                                f"FAR from VF (GAP={gap_pct:+.2f}%) "
+                                f"— bad local minimum, try different seed or lower LR"
+                            )
+                            logger.warning(
+                                "Patience stop (far from VF) epoch=%d best_val=%.4f "
+                                "VF=%.4f GAP=%.2f%%",
+                                epoch, best_val_final, target_vf, gap_pct,
+                            )
+                        tqdm.write(
+                            f"Early stop at epoch {epoch}: {verdict}  "
+                            f"best_val={best_val_final:.4f} VF={target_vf:.4f}"
+                        )
+                    else:
+                        tqdm.write(
+                            f"Early stopping at epoch {epoch}: no improvement for "
+                            f"{patience} checks ({patience * validation_freq} epochs)."
+                        )
+                        logger.info("Early stop epoch=%d patience=%d", epoch, patience)
+                    break
 
             end_time = datetime.now()
             duration = end_time - start_time
             per_epoch_time = duration.total_seconds() / (epoch + 1)
             remaining_time = (epochs - epoch) * per_epoch_time
             if epoch % log_freq == 0:
+                current_lr = optimizer_parameters.param_groups[0]['lr']
                 logger.info(
                     f"Epoch {epoch}/{epochs}"
                     f" - Training cost: {train_loss / sourcing_periods:.4f}"
+                    f" - lr: {current_lr:.6f}"
                     f" - Per epoch time: {per_epoch_time:.2f} seconds"
                     f" - Est. Remaining time: {int(remaining_time)} seconds."
                 )
 
-        # Restore best weights (always on CPU for portability)
+        # Restore best weights and best init inventory
         if best_state is not None:
             self.cpu()
             self.load_state_dict(best_state)
+            if best_init_inventory is not None:
+                sourcing_model.init_inventory.data.fill_(best_init_inventory)
         else:
             self.cpu()
 
         end_time = datetime.now()
         duration = end_time - start_time
-        self.save_checkpoint(checkpoint_path)
+        self.save_checkpoint(checkpoint_path, init_inventory=best_init_inventory)
         logger.info(f"Training completed at {end_time}")
         logger.info(f"Total training duration: {duration}")
         logger.info(
@@ -470,15 +543,18 @@ class CyclicDualNeuralController(torch.nn.Module, BaseNeuralController):
             / sourcing_periods
         )
 
-    def save_checkpoint(self, path: str) -> None:
+    def save_checkpoint(self, path: str, init_inventory: Optional[float] = None) -> None:
         """Save model checkpoint including state dict and sourcing model config."""
         import os
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        dirpath = os.path.dirname(path)
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
+        inv = init_inventory if init_inventory is not None else self.sourcing_model.init_inventory.item()
         torch.save({
             'model_state_dict': self.state_dict(),
             'hidden_layers': self.hidden_layers,
             'n_cycles': self.n_cycles,
-            'init_inventory': self.sourcing_model.init_inventory.item(),
+            'init_inventory': inv,
         }, path)
         logger.info(f"Checkpoint saved to {path}")
 
@@ -491,17 +567,6 @@ class CyclicDualNeuralController(torch.nn.Module, BaseNeuralController):
     ) -> 'CyclicDualNeuralController':
         """
         Load a saved checkpoint for inference.
-
-        Parameters
-        ----------
-        path : str
-            Path to the .pt checkpoint file.
-        sourcing_model : DualSourcingModel
-            The sourcing model to attach to the controller.
-        device : str, default 'cpu'
-            Device to load the model onto ('cpu' or 'cuda').
-            Pass the same device used during training so evaluation
-            runs on GPU rather than CPU.
         """
         _dev = torch.device(device)
         checkpoint = torch.load(path, map_location=_dev)
@@ -516,6 +581,11 @@ class CyclicDualNeuralController(torch.nn.Module, BaseNeuralController):
         controller.load_state_dict(checkpoint['model_state_dict'])
         controller.to(_dev)
         controller.sourcing_model = sourcing_model
+        
+        # Restore trained initial inventory into the sourcing model
+        if 'init_inventory' in checkpoint:
+            sourcing_model.init_inventory.data.fill_(checkpoint['init_inventory'])
         sourcing_model.init_inventory.data = sourcing_model.init_inventory.data.to(_dev)
+        
         logger.info(f"Checkpoint loaded from {path} onto {device}")
-        return controller
+        return controller

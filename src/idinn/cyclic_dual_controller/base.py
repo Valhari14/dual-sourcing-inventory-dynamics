@@ -1,24 +1,16 @@
-from abc import ABCMeta, abstractmethod
-from typing import List, Optional, Tuple, Union, no_type_check
+from abc import ABC, abstractmethod
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from matplotlib import pyplot as plt
 from numpy.typing import NDArray
 
 from ..sourcing_model import DualSourcingModel
 
 
-from typing import Optional, Union, List, Tuple
-from abc import abstractmethod, ABC
-import torch
-
-from ..sourcing_model import DualSourcingModel
-
 class BaseDPController(ABC):
-
     """
-    Base class for DP Controllers 
+    Base class for Dynamic Programming Controllers in cyclic dual-sourcing systems.
     """
 
     @abstractmethod
@@ -56,16 +48,16 @@ class BaseDPController(ABC):
         pass 
 
     @abstractmethod
-    def get_total_cost(self, sourcing_model, sorcing_periods, seed) -> torch.torch.Tensor:
+    def get_total_cost(self, sourcing_model: DualSourcingModel, sourcing_periods: int, seed: Optional[int] = None) -> torch.Tensor:
         """
-        Accumlate cost over sourcing periods 
+        Accumulate total cost over sourcing periods.
         """
         pass 
 
     @abstractmethod
-    def get_average_cost(self, sourcing_model, sourcing_periods, seed) -> torch.Tensor:
+    def get_average_cost(self, sourcing_model: DualSourcingModel, sourcing_periods: int, seed: Optional[int] = None) -> torch.Tensor:
         """
-        Return average cost over sourcing periods
+        Return average cost over sourcing periods.
         """
         pass 
 
@@ -99,6 +91,8 @@ class BaseDPController(ABC):
         else:
             return past_orders
 
+
+BaseDualController = BaseDPController
 
 
 class BaseNeuralController(ABC):
@@ -156,16 +150,16 @@ class BaseNeuralController(ABC):
         pass 
 
     @abstractmethod
-    def get_total_cost(self, sourcing_model, sorcing_periods, seed) -> torch.torch.Tensor:
+    def get_total_cost(self, sourcing_model: DualSourcingModel, sourcing_periods: int, seed: Optional[int] = None) -> torch.Tensor:
         """
-        Accumlate cost over sourcing periods 
+        Accumulate total cost over sourcing periods.
         """
         pass 
 
     @abstractmethod
-    def get_average_cost(self, sourcing_model, sourcing_periods, seed) -> torch.Tensor:
+    def get_average_cost(self, sourcing_model: DualSourcingModel, sourcing_periods: int, seed: Optional[int] = None) -> torch.Tensor:
         """
-        Return average cost over sourcing periods
+        Return average cost over sourcing periods.
         """
         pass 
 

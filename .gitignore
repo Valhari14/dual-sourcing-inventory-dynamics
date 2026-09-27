@@ -208,3 +208,7 @@ output/
 # uv
 .python-version
 uv.lock
+
+# Ignore local checkpoint directories and zip archives
+checkpoints/
+*.zip
