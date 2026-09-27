@@ -1,13 +1,35 @@
 """
-hp_grid_search.py  --  Hyperparameter grid search for CyclicDualNeuralController
-Three modes: scan (6-combo grid), full (single combo + seed_train), infer (GAP%).
-Device-agnostic: --device cpu | cuda. RMSprop, no scheduler, no grad-clip.
+hp_grid_search.py -- Neural Network Training & Transfer Learning for Cyclic Dual-Sourcing
+
+Provides end-to-end training, transfer learning, and evaluation for CyclicDualNeuralController
+under periodic dual-sourcing inventory dynamics (Böttcher et al., 2023).
+
+Usage Examples:
+  # 1. Train base model from scratch:
+  python src/idinn/finetuning/hp_grid_search.py \\
+      --mode train --n_cycles 3 --lt_s 2 --shortage_cost 95 --demand_high 4 \\
+      --checkpoint_dir models/base_c3_ls2_b95
+
+  # 2. Transfer fine-tuning (e.g., lead-time expansion from ls=2 to ls=3):
+  python src/idinn/finetuning/hp_grid_search.py \\
+      --mode train --n_cycles 3 --lt_s 3 --shortage_cost 95 --demand_high 4 \\
+      --lr 0.0002 --base_checkpoint models/base_c3_ls2_b95 \\
+      --checkpoint_dir models/transfer_c3_ls3_b95
+
+  # 3. Evaluate trained policy across 500 test seeds and compute GAP%:
+  python src/idinn/finetuning/hp_grid_search.py \\
+      --mode infer --n_cycles 3 --lt_s 3 --shortage_cost 95 --demand_high 4 \\
+      --vf 106.0125 --checkpoint_dir models/transfer_c3_ls3_b95
 """
 
 import argparse
+import concurrent.futures
 import logging
+import math
+import multiprocessing as mp
 import os
 import shutil
+import sys
 import time
 from typing import List, Optional
 
@@ -15,13 +37,34 @@ import torch
 from tqdm import tqdm
 
 from src.idinn.cyclic_dual_controller.cyclic_dual_neural import CyclicDualNeuralController
-from src.idinn.sourcing_model import DualSourcingModel
 from src.idinn.demand import UniformDemand
+from src.idinn.sourcing_model import DualSourcingModel
 
-_LOG_FILE = "src/idinn/finetuning/hp_grid_search.log"
-logging.basicConfig(filename=_LOG_FILE, level=logging.INFO,
-                    format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger(__name__)
+# -----------------------------------------------------------------------------
+# Dual-Sourcing Benchmark Constants (Böttcher et al., 2023)
+# -----------------------------------------------------------------------------
+HOLDING_COST: float = 5.0
+EXPEDITED_COST: float = 20.0
+REGULAR_ORDER_COST: float = 0.0
+EXPEDITED_LEAD_TIME: int = 0
+DEMAND_LOW: int = 0
+
+# Optimization & Architecture Defaults
+DEFAULT_HIDDEN_LAYERS: List[int] = [64, 32, 16, 8, 4]
+BATCH_SIZE: int = 512
+INIT_INVENTORY_LR: float = 0.1
+DEFAULT_EPOCHS: int = 6000
+DEFAULT_PATIENCE: int = 15
+OPTIMIZER_TYPE: str = "rmsprop"
+USE_GRAD_CLIP: bool = True
+
+# Evaluation Constants
+EVAL_PERIODS: int = 1000
+EVAL_SEEDS: int = 500
+VF_GAP_TOL: float = 0.005
+VF_PATIENCE: int = 5
+
+DEFAULT_DEVICE: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 GRID_LRS: List[float] = [3e-4, 1e-3, 3e-3]
 GRID_LAYERS: List[List[int]] = [
@@ -29,66 +72,110 @@ GRID_LAYERS: List[List[int]] = [
     [128, 64, 32, 16, 8, 4, 2],
 ]
 
-OPTIMIZER_TYPE: str = "rmsprop"
-USE_SCHEDULER: bool  = False
-USE_GRAD_CLIP: bool  = False
-
-EVAL_PERIODS: int = 1000
-EVAL_SEEDS: int   = 500
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger(__name__)
 
 
 def _sourcing_periods_for(lt_s: int) -> int:
-    """Paper EC.5.1: T=100/150/200 for lt_s=2/3/4."""
-    if lt_s <= 2:   return 100
-    elif lt_s == 3: return 150
-    elif lt_s == 4: return 200
-    else:           return 200 + (lt_s - 4) * 50
+    """Horizon scaling per regular lead time: T=100/150/200 for lt_s=2/3/4+."""
+    if lt_s <= 2:
+        return 100
+    elif lt_s == 3:
+        return 150
+    elif lt_s == 4:
+        return 200
+    else:
+        return 200 + (lt_s - 4) * 50
 
 
-def _build_sourcing_model(lt_s, n_cycles, shortage_cost, expedited_cost,
-                          demand_low, demand_high, batch_size):
+def _build_sourcing_model(
+    lt_s: int,
+    n_cycles: int,
+    shortage_cost: float,
+    demand_high: int,
+    expedited_cost: float = EXPEDITED_COST,
+    demand_low: int = DEMAND_LOW,
+    batch_size: int = BATCH_SIZE,
+    init_inventory: Optional[float] = None,
+) -> DualSourcingModel:
+    """Instantiate the dual-sourcing simulation environment with benchmark parameters."""
+    if init_inventory is None:
+        mean_demand = (demand_low + demand_high) / 2.0
+        init_inv = float((lt_s + 1) * mean_demand)
+    else:
+        init_inv = float(init_inventory)
+
     return DualSourcingModel(
-        regular_lead_time=lt_s, expedited_lead_time=0,
-        regular_order_cost=0, expedited_order_cost=expedited_cost,
-        holding_cost=5, shortage_cost=shortage_cost,
-        init_inventory=0,
+        regular_lead_time=lt_s,
+        expedited_lead_time=EXPEDITED_LEAD_TIME,
+        regular_order_cost=REGULAR_ORDER_COST,
+        expedited_order_cost=expedited_cost,
+        holding_cost=HOLDING_COST,
+        shortage_cost=shortage_cost,
+        init_inventory=init_inv,
         demand_generator=UniformDemand(demand_low, demand_high),
         batch_size=batch_size,
     )
 
 
-def _load_pretrained(base_checkpoint, hidden_layers, n_cycles, sourcing_model):
+def _load_pretrained(base_checkpoint: str, hidden_layers: List[int], n_cycles: int, sourcing_model: DualSourcingModel):
+    """
+    Load pre-trained weights and adapt to new lead time or cycle length.
+    Expands input dimension by preserving existing pipeline weights and zero-initializing
+    new lead-time slots. Re-initializes output heads if cycle length N changes.
+    """
+    if os.path.isdir(base_checkpoint):
+        best_pt = os.path.join(base_checkpoint, "best_model.pt")
+        if os.path.exists(best_pt):
+            base_checkpoint = best_pt
+
     if not os.path.exists(base_checkpoint):
-        raise FileNotFoundError(f"Base checkpoint not found: {base_checkpoint!r}. "
-                                "Train base first (--mode full without --base_checkpoint).")
+        raise FileNotFoundError(f"Base checkpoint not found: {base_checkpoint!r}.")
+
     ckpt = torch.load(base_checkpoint, map_location="cpu")
-    ps   = ckpt["model_state_dict"]
-    ph   = ckpt["hidden_layers"]
-    pc   = ckpt.get("n_cycles", 2)
+    ps = ckpt["model_state_dict"]
+    ph = ckpt.get("hidden_layers", hidden_layers)
+    pc = ckpt.get("n_cycles", n_cycles)
+
+    if ph != hidden_layers:
+        logger.info("Inheriting base checkpoint hidden_layers: %s (requested: %s)", ph, hidden_layers)
+        hidden_layers = ph
 
     ctrl = CyclicDualNeuralController(hidden_layers=hidden_layers, n_cycles=n_cycles)
-    ctrl.init_layers(regular_lead_time=sourcing_model.get_regular_lead_time(),
-                     expedited_lead_time=sourcing_model.get_expedited_lead_time())
+    ctrl.init_layers(
+        regular_lead_time=sourcing_model.get_regular_lead_time(),
+        expedited_lead_time=sourcing_model.get_expedited_lead_time(),
+    )
     ctrl.sourcing_model = sourcing_model
     sourcing_model.init_inventory.data.fill_(ckpt["init_inventory"])
 
-    cs   = ctrl.state_dict()
-    skip: set = set()
+    cs = ctrl.state_dict()
+    skip = set()
 
     pi = ps["model.0.weight"].shape[1]
     ci = cs["model.0.weight"].shape[1]
+
     if pi != ci:
-        skip.update({"model.0.weight", "model.0.bias"})
-        msg = f"Input dim {pi}->{ci}: re-init first layer."
-        logger.info(msg); print(msg)
+        if ci > pi:
+            # Lead-time expansion: copy trained weights for existing pipeline slots, zero-init new slots
+            with torch.no_grad():
+                new_w = cs["model.0.weight"].clone()
+                new_w[:, :pi] = ps["model.0.weight"]
+                new_w[:, pi:] = 0.0
+                cs["model.0.weight"] = new_w
+                cs["model.0.bias"] = ps["model.0.bias"].clone()
+            skip.update({"model.0.weight", "model.0.bias"})
+            logger.info("Input dim expanded %d -> %d: preserved weights, zero-initialized %d new slot(s).", pi, ci, ci - pi)
+        else:
+            skip.update({"model.0.weight", "model.0.bias"})
+            logger.info("Input dim reduced %d -> %d: re-initializing input layer.", pi, ci)
 
     ok = f"model.{2 * len(ph)}"
     po = ps[f"{ok}.weight"].shape[0]
     co = cs[f"{ok}.weight"].shape[0]
     if po != co:
         skip.update({f"{ok}.weight", f"{ok}.bias"})
-        msg = f"Output dim {po}->{co} (n_cycles {pc}->{n_cycles}): re-init output layer."
-        logger.info(msg); print(msg)
+        logger.info("Output dim %d -> %d (cycles %d -> %d): re-initializing output heads.", po, co, pc, n_cycles)
 
     if skip:
         compat = {k: v for k, v in ps.items() if k not in skip}
@@ -96,13 +183,31 @@ def _load_pretrained(base_checkpoint, hidden_layers, n_cycles, sourcing_model):
         ctrl.load_state_dict(cs)
     else:
         ctrl.load_state_dict(ps)
-        print("All dims match -- loaded all pretrained weights.")
+        logger.info("All model dimensions match -- loaded full pre-trained checkpoint.")
+
     return ctrl
 
 
-def _train_one(*, hidden_layers, n_cycles, sourcing_model, sourcing_periods,
-               epochs, parameters_lr, init_inventory_lr, seed, checkpoint_path,
-               base_checkpoint, device):
+def _train_one(
+    *,
+    hidden_layers: List[int],
+    n_cycles: int,
+    sourcing_model: DualSourcingModel,
+    sourcing_periods: int,
+    epochs: int,
+    parameters_lr: float,
+    init_inventory_lr: float,
+    seed: int,
+    checkpoint_path: str,
+    base_checkpoint: Optional[str],
+    device: str,
+    patience: int = DEFAULT_PATIENCE,
+    use_scheduler: bool = False,
+    target_vf: Optional[float] = None,
+    vf_gap_tol: float = VF_GAP_TOL,
+    vf_patience: int = VF_PATIENCE,
+):
+    """Execute training for a single model instance."""
     if base_checkpoint:
         ctrl = _load_pretrained(base_checkpoint, hidden_layers, n_cycles, sourcing_model)
     else:
@@ -113,347 +218,320 @@ def _train_one(*, hidden_layers, n_cycles, sourcing_model, sourcing_periods,
         sourcing_periods=sourcing_periods,
         epochs=epochs,
         validation_sourcing_periods=1000,
-        validation_freq=50,
+        validation_freq=min(200, epochs),
         log_freq=10,
         init_inventory_lr=init_inventory_lr,
         parameters_lr=parameters_lr,
         seed=seed,
         checkpoint_path=checkpoint_path,
         optimizer_type=OPTIMIZER_TYPE,
-        use_scheduler=USE_SCHEDULER,
+        use_scheduler=use_scheduler,
         use_grad_clip=USE_GRAD_CLIP,
         device=device,
+        patience=patience,
+        target_vf=target_vf,
+        vf_gap_tol=vf_gap_tol,
+        vf_patience=vf_patience,
     )
 
 
 def run_scan(args):
+    """Execute hyperparameter grid scan across candidate learning rates and layer sizes."""
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     sp = args.sourcing_periods or _sourcing_periods_for(args.lt_s)
-    print(f"\n{'='*64}\nSCAN  lt_s={args.lt_s} n_cycles={args.n_cycles} "
-          f"b={args.shortage_cost} demand=U({args.demand_low},{args.demand_high})\n"
-          f"optimizer={OPTIMIZER_TYPE} scheduler={USE_SCHEDULER} "
-          f"grad_clip={USE_GRAD_CLIP} batch={args.batch_size}\n"
-          f"T={sp} epochs={args.epochs} device={args.device}\n{'='*64}")
-    logger.info("SCAN: lt_s=%d n_cycles=%d b=%d epochs=%d sp=%d device=%s",
-                args.lt_s, args.n_cycles, args.shortage_cost, args.epochs, sp, args.device)
+    epochs = args.epochs or 800
+
+    logger.info("Starting HP Scan: lt_s=%d, N=%d, b=%.1f, epochs=%d, device=%s",
+                args.lt_s, args.n_cycles, args.shortage_cost, epochs, args.device)
 
     results = []
     total = len(GRID_LRS) * len(GRID_LAYERS)
     c = 0
+
     for lr in GRID_LRS:
         for layers in GRID_LAYERS:
             c += 1
-            ls   = ",".join(str(x) for x in layers)
-            ckpt = os.path.join(args.checkpoint_dir,
-                                f"scan_lr{lr}_layers{ls.replace(',','_')}.pt")
+            ls = ",".join(str(x) for x in layers)
+            ckpt = os.path.join(args.checkpoint_dir, f"scan_lr{lr}_layers{ls.replace(',', '_')}.pt")
             print(f"\n[{c}/{total}] lr={lr} layers=[{ls}]")
             t0 = time.time()
-            sm = _build_sourcing_model(args.lt_s, args.n_cycles, args.shortage_cost,
-                                       args.expedited_cost, args.demand_low,
-                                       args.demand_high, args.batch_size)
-            _train_one(hidden_layers=layers, n_cycles=args.n_cycles,
-                       sourcing_model=sm, sourcing_periods=sp,
-                       epochs=args.epochs, parameters_lr=lr,
-                       init_inventory_lr=args.init_inventory_lr,
-                       seed=args.seed, checkpoint_path=ckpt,
-                       base_checkpoint=args.base_checkpoint, device=args.device)
+
+            sm = _build_sourcing_model(
+                args.lt_s, args.n_cycles, args.shortage_cost,
+                demand_high=args.demand_high, expedited_cost=args.expedited_cost,
+                demand_low=args.demand_low, batch_size=args.batch_size,
+                init_inventory=args.init_inventory,
+            )
+            _train_one(
+                hidden_layers=layers, n_cycles=args.n_cycles, sourcing_model=sm,
+                sourcing_periods=sp, epochs=epochs, parameters_lr=lr,
+                init_inventory_lr=args.init_inventory_lr, seed=args.seed,
+                checkpoint_path=ckpt, base_checkpoint=args.base_checkpoint,
+                device=args.device, patience=args.patience, use_scheduler=args.use_scheduler,
+            )
             elapsed = time.time() - t0
-            esm = _build_sourcing_model(args.lt_s, args.n_cycles, args.shortage_cost,
-                                        args.expedited_cost, args.demand_low,
-                                        args.demand_high, args.batch_size)
+
+            esm = _build_sourcing_model(
+                args.lt_s, args.n_cycles, args.shortage_cost,
+                demand_high=args.demand_high, expedited_cost=args.expedited_cost,
+                demand_low=args.demand_low, batch_size=args.batch_size,
+                init_inventory=args.init_inventory,
+            )
             ec = CyclicDualNeuralController.load_checkpoint(ckpt, esm, device=args.device)
             with torch.no_grad():
                 ev = [ec.get_average_cost(esm, 1000, seed=s) for s in range(20)]
-            mu  = torch.stack(ev).mean().item()
+            mu = torch.stack(ev).mean().item()
             std = torch.stack(ev).std().item()
             results.append((mu, lr, layers, std, ckpt))
-            print(f"  {elapsed/60:.1f}min | val_mean={mu:.4f} std={std:.4f}")
-            logger.info("Combo %d: lr=%s layers=%s mu=%.4f std=%.4f t=%.0fs",
-                        c, lr, layers, mu, std, elapsed)
+            print(f"  {elapsed / 60:.1f}min | val_mean={mu:.4f} std={std:.4f}")
 
     results.sort(key=lambda x: x[0])
-    print(f"\n{'='*64}\nSCAN SUMMARY (lower val_mean = better)\n{'='*64}")
-    print(f"{'Rk':<4} {'LR':<9} {'Layers':<30} {'ValMean':<11} ValStd")
-    print("-"*60)
-    for i, (mu, lr, layers, std, _) in enumerate(results, 1):
-        tag = " <-- WINNER" if i == 1 else ""
-        print(f"{i:<4} {lr:<9} {str(layers):<30} {mu:<11.4f} {std:.4f}{tag}")
-    print(f"{'='*64}")
-
     bmu, blr, bl, bstd, bckpt = results[0]
     dest = os.path.join(args.checkpoint_dir, "best_scan_model.pt")
     shutil.copy(bckpt, dest)
-    la = ",".join(str(x) for x in bl)
-    print(f"\nWinner -> {dest}\n"
-          f"  lr={blr}  layers={bl}\n"
-          f"  val_mean={bmu:.4f} val_std={bstd:.4f}\n\n"
-          f'Next: --mode full --parameters_lr {blr} --hidden_layers "{la}"')
-    logger.info("Winner: lr=%s layers=%s val_mean=%.4f", blr, bl, bmu)
+    print(f"\nWinner -> {dest} | lr={blr} layers={bl} val_mean={bmu:.4f}")
 
-
-# ---------------------------------------------------------------------------
-# Parallel seed worker  
-# ---------------------------------------------------------------------------
 
 def _seed_worker(worker_cfg: dict) -> dict:
-    """
-    Train ONE seed and evaluate it.  Runs inside a subprocess spawned by
-    ProcessPoolExecutor so that multiple seeds execute concurrently on the
-    same GPU.  Returns dict: {seed, mean_cost, std_cost, ckpt_path}.
-    """
-    import sys, os
-    sys.path.insert(0, os.getcwd())          # ensure repo root is on path
+    """Worker task for multiprocessing seed training."""
+    sys.path.insert(0, os.getcwd())
 
-    import torch
-    import logging
-    logging.disable(logging.CRITICAL)        # suppress log noise from workers
+    seed = worker_cfg["seed"]
+    ckpt_path = worker_cfg["ckpt_path"]
 
-    seed          = worker_cfg["seed"]
-    hl            = worker_cfg["hidden_layers"]
-    n_cycles      = worker_cfg["n_cycles"]
-    lt_s          = worker_cfg["lt_s"]
-    shortage_cost = worker_cfg["shortage_cost"]
-    expedited_cost= worker_cfg["expedited_cost"]
-    demand_low    = worker_cfg["demand_low"]
-    demand_high   = worker_cfg["demand_high"]
-    batch_size    = worker_cfg["batch_size"]
-    sp            = worker_cfg["sourcing_periods"]
-    epochs        = worker_cfg["epochs"]
-    parameters_lr = worker_cfg["parameters_lr"]
-    init_inv_lr   = worker_cfg["init_inventory_lr"]
-    base_ckpt     = worker_cfg["base_checkpoint"]
-    device        = worker_cfg["device"]
-    ckpt_path     = worker_cfg["ckpt_path"]
+    seed_log_dir = os.path.dirname(ckpt_path)
+    os.makedirs(seed_log_dir, exist_ok=True)
+    seed_log_path = os.path.join(seed_log_dir, f"seed_{seed}.log")
 
-    sm = _build_sourcing_model(lt_s, n_cycles, shortage_cost, expedited_cost,
-                               demand_low, demand_high, batch_size)
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(logging.INFO)
+    fh = logging.FileHandler(seed_log_path, mode="w")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    root_logger.addHandler(fh)
+
+    sm = _build_sourcing_model(
+        worker_cfg["lt_s"], worker_cfg["n_cycles"], worker_cfg["shortage_cost"],
+        demand_high=worker_cfg["demand_high"], expedited_cost=worker_cfg["expedited_cost"],
+        demand_low=worker_cfg["demand_low"], batch_size=worker_cfg["batch_size"],
+        init_inventory=worker_cfg.get("init_inventory"),
+    )
 
     if not os.path.exists(ckpt_path):
         _train_one(
-            hidden_layers=hl, n_cycles=n_cycles,
-            sourcing_model=sm, sourcing_periods=sp,
-            epochs=epochs, parameters_lr=parameters_lr,
-            init_inventory_lr=init_inv_lr,
-            seed=seed, checkpoint_path=ckpt_path,
-            base_checkpoint=base_ckpt, device=device,
+            hidden_layers=worker_cfg["hidden_layers"], n_cycles=worker_cfg["n_cycles"],
+            sourcing_model=sm, sourcing_periods=worker_cfg["sourcing_periods"],
+            epochs=worker_cfg["epochs"], parameters_lr=worker_cfg["parameters_lr"],
+            init_inventory_lr=worker_cfg["init_inventory_lr"], seed=seed,
+            checkpoint_path=ckpt_path, base_checkpoint=worker_cfg["base_checkpoint"],
+            device=worker_cfg["device"], patience=worker_cfg["patience"],
+            use_scheduler=worker_cfg["use_scheduler"], target_vf=worker_cfg.get("target_vf"),
+            vf_gap_tol=worker_cfg.get("vf_gap_tol", VF_GAP_TOL),
+            vf_patience=worker_cfg.get("vf_patience", VF_PATIENCE),
         )
 
-    # ---- evaluate -------------------------------------------------------
-    from src.idinn.cyclic_dual_controller.cyclic_dual_neural import CyclicDualNeuralController
-    esm  = _build_sourcing_model(lt_s, n_cycles, shortage_cost, expedited_cost,
-                                 demand_low, demand_high, batch_size)
-    ctrl = CyclicDualNeuralController.load_checkpoint(ckpt_path, esm, device=device)
+    esm = _build_sourcing_model(
+        worker_cfg["lt_s"], worker_cfg["n_cycles"], worker_cfg["shortage_cost"],
+        demand_high=worker_cfg["demand_high"], expedited_cost=worker_cfg["expedited_cost"],
+        demand_low=worker_cfg["demand_low"], batch_size=worker_cfg["batch_size"],
+        init_inventory=worker_cfg.get("init_inventory"),
+    )
+    ctrl = CyclicDualNeuralController.load_checkpoint(ckpt_path, esm, device=worker_cfg["device"])
     costs = []
     with torch.no_grad():
         for es in range(EVAL_SEEDS):
             costs.append(ctrl.get_average_cost(esm, EVAL_PERIODS, seed=es))
-    mu  = torch.stack(costs).mean().item()
+
+    mu = torch.stack(costs).mean().item()
     std = torch.stack(costs).std().item()
     return {"seed": seed, "mean_cost": mu, "std_cost": std, "ckpt_path": ckpt_path}
 
 
 def run_full(args):
-    if args.parameters_lr is None: raise ValueError("--parameters_lr required for full")
-    if args.hidden_layers  is None: raise ValueError("--hidden_layers required for full")
+    """Execute complete training run (scratch or transfer fine-tuning)."""
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    hl   = [int(x) for x in args.hidden_layers.split(",")]
-    sp   = args.sourcing_periods or _sourcing_periods_for(args.lt_s)
-    best = os.path.join(args.checkpoint_dir, "best_model.pt")
-    parallel = max(1, args.parallel_seeds)
 
-    print(
-        f"\n{'='*64}\n"
-        f"FULL  lt_s={args.lt_s} n_cycles={args.n_cycles} "
-        f"b={args.shortage_cost} lr={args.parameters_lr} layers={hl}\n"
-        f"T={sp} epochs={args.epochs} n_seeds={args.n_seeds} "
-        f"parallel_seeds={parallel} device={args.device}\n"
-        f"{'='*64}"
-    )
-    logger.info("FULL: lt_s=%d nc=%d b=%d lr=%s hl=%s ns=%d par=%d dev=%s",
-                args.lt_s, args.n_cycles, args.shortage_cost, args.parameters_lr,
-                hl, args.n_seeds, parallel, args.device)
+    # Determine learning rate
+    lr = args.lr if args.lr is not None else (2e-4 if args.base_checkpoint else 1e-3)
+
+    # Determine hidden layer architecture
+    if args.hidden_layers:
+        hl = [int(x) for x in args.hidden_layers.split(",")]
+    else:
+        hl = DEFAULT_HIDDEN_LAYERS
+
+    sp = args.sourcing_periods or _sourcing_periods_for(args.lt_s)
+    epochs = args.epochs or DEFAULT_EPOCHS
+    best = os.path.join(args.checkpoint_dir, "best_model.pt")
+
+    logger.info("Running training: lt_s=%d, N=%d, b=%.1f, lr=%.6f, layers=%s, epochs=%d, device=%s",
+                args.lt_s, args.n_cycles, args.shortage_cost, lr, hl, epochs, args.device)
 
     if args.n_seeds <= 1:
-        # ---- single seed (original behaviour) ---------------------------
-        sm = _build_sourcing_model(args.lt_s, args.n_cycles, args.shortage_cost,
-                                   args.expedited_cost, args.demand_low,
-                                   args.demand_high, args.batch_size)
-        _train_one(hidden_layers=hl, n_cycles=args.n_cycles,
-                   sourcing_model=sm, sourcing_periods=sp,
-                   epochs=args.epochs, parameters_lr=args.parameters_lr,
-                   init_inventory_lr=args.init_inventory_lr,
-                   seed=args.seed, checkpoint_path=best,
-                   base_checkpoint=args.base_checkpoint, device=args.device)
-        print(f"Checkpoint -> {best}")
+        sm = _build_sourcing_model(
+            args.lt_s, args.n_cycles, args.shortage_cost,
+            demand_high=args.demand_high, expedited_cost=args.expedited_cost,
+            demand_low=args.demand_low, batch_size=args.batch_size,
+            init_inventory=args.init_inventory,
+        )
+        _train_one(
+            hidden_layers=hl, n_cycles=args.n_cycles, sourcing_model=sm,
+            sourcing_periods=sp, epochs=epochs, parameters_lr=lr,
+            init_inventory_lr=args.init_inventory_lr, seed=args.seed,
+            checkpoint_path=best, base_checkpoint=args.base_checkpoint,
+            device=args.device, patience=args.patience, use_scheduler=args.use_scheduler,
+            target_vf=args.vf, vf_gap_tol=args.vf_gap_tol, vf_patience=args.vf_patience,
+        )
+        print(f"\nModel checkpoint saved -> {best}")
         return
 
-    # ---- multi-seed: sequential or parallel -----------------------------
+    # Multi-seed execution
     sd = os.path.join(args.checkpoint_dir, "seeded")
     os.makedirs(sd, exist_ok=True)
-
-    # Build list of per-seed configs
     worker_cfgs = [
         dict(
-            seed=s,
-            hidden_layers=hl,
-            n_cycles=args.n_cycles,
-            lt_s=args.lt_s,
-            shortage_cost=args.shortage_cost,
-            expedited_cost=args.expedited_cost,
-            demand_low=args.demand_low,
-            demand_high=args.demand_high,
-            batch_size=args.batch_size,
-            sourcing_periods=sp,
-            epochs=args.epochs,
-            parameters_lr=args.parameters_lr,
-            init_inventory_lr=args.init_inventory_lr,
-            base_checkpoint=args.base_checkpoint,
-            device=args.device,
-            ckpt_path=os.path.join(sd, f"model_seed{s}.pt"),
+            seed=s, hidden_layers=hl, n_cycles=args.n_cycles, lt_s=args.lt_s,
+            shortage_cost=args.shortage_cost, expedited_cost=args.expedited_cost,
+            demand_low=args.demand_low, demand_high=args.demand_high,
+            batch_size=args.batch_size, init_inventory=args.init_inventory,
+            sourcing_periods=sp, epochs=epochs, parameters_lr=lr,
+            init_inventory_lr=args.init_inventory_lr, base_checkpoint=args.base_checkpoint,
+            device=args.device, target_vf=args.vf, vf_gap_tol=args.vf_gap_tol,
+            vf_patience=args.vf_patience, patience=args.patience,
+            use_scheduler=args.use_scheduler, ckpt_path=os.path.join(sd, f"model_seed{s}.pt"),
         )
         for s in range(args.n_seeds)
     ]
 
-    results = []   # list of {seed, mean_cost, std_cost, ckpt_path}
+    results = []
+    parallel = max(1, args.parallel_seeds)
 
     if parallel <= 1:
-        # ---- sequential (fallback / CPU) --------------------------------
         for cfg in worker_cfgs:
-            s = cfg["seed"]
-            ckpt = cfg["ckpt_path"]
-            print(f"\n[Seed {s}/{args.n_seeds-1}] Training..." if not os.path.exists(ckpt)
-                  else f"[Seed {s}] Checkpoint exists -- skipping training.")
             r = _seed_worker(cfg)
-            print(f"[Seed {s}] mean={r['mean_cost']:.4f}  std={r['std_cost']:.4f}")
-            logger.info("Seed %d: mean=%.4f std=%.4f", s, r["mean_cost"], r["std_cost"])
             results.append(r)
     else:
-        # ---- parallel via ProcessPoolExecutor (spawn context for CUDA) --
-        import concurrent.futures
-        import multiprocessing as _mp
-        ctx = _mp.get_context("spawn")
-        print(f"Launching {args.n_seeds} seeds across {parallel} parallel workers...")
-        print("(Each worker trains one seed independently on the same GPU.)\n")
-
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=parallel,
-            mp_context=ctx,
-        ) as executor:
-            # Submit all seeds; executor queues them, running `parallel` at a time
-            future_to_seed = {
-                executor.submit(_seed_worker, cfg): cfg["seed"]
-                for cfg in worker_cfgs
-            }
-            done = 0
+        ctx = mp.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=parallel, mp_context=ctx) as executor:
+            future_to_seed = {executor.submit(_seed_worker, cfg): cfg["seed"] for cfg in worker_cfgs}
             for future in concurrent.futures.as_completed(future_to_seed):
-                s = future_to_seed[future]
-                try:
-                    r = future.result()
-                    done += 1
-                    print(f"[{done}/{args.n_seeds}] Seed {s} done: "
-                          f"mean={r['mean_cost']:.4f}  std={r['std_cost']:.4f}")
-                    logger.info("Seed %d: mean=%.4f std=%.4f", s, r["mean_cost"], r["std_cost"])
-                    results.append(r)
-                except Exception as exc:
-                    print(f"[Seed {s}] FAILED: {exc}")
-                    logger.error("Seed %d failed: %s", s, exc)
+                results.append(future.result())
 
-    # ---- pick global winner -----------------------------------------
-    if not results:
-        raise RuntimeError("All seeds failed — check logs.")
+    valid = [r for r in results if math.isfinite(r["mean_cost"])]
+    if not valid:
+        raise RuntimeError("All seeds diverged (NaN/Inf cost). Try lowering learning rate.")
 
-    results.sort(key=lambda r: r["mean_cost"])
-    best_r = results[0]
+    valid.sort(key=lambda r: r["mean_cost"])
+    best_r = valid[0]
     shutil.copy(best_r["ckpt_path"], best)
-
-    print(f"\n{'='*64}")
-    print(f"seed_train complete.")
-    print(f"  Best seed  : {best_r['seed']}")
-    print(f"  Mean cost  : {best_r['mean_cost']:.4f}")
-    print(f"  Std        : {best_r['std_cost']:.4f}")
-    print(f"  Checkpoint : {best}")
-    print(f"{'='*64}\n")
-    logger.info("seed_train done: best_seed=%d cost=%.4f -> %s",
-                best_r["seed"], best_r["mean_cost"], best)
-
+    print(f"\nBest seed: {best_r['seed']} | Cost: {best_r['mean_cost']:.4f} (std {best_r['std_cost']:.4f}) -> {best}")
 
 
 def run_infer(args):
+    """Evaluate pre-trained model over 500 test seeds and compute certified GAP%."""
     best = os.path.join(args.checkpoint_dir, "best_model.pt")
     if not os.path.exists(best):
-        raise FileNotFoundError(f"No best_model.pt in {args.checkpoint_dir!r}. Run --mode full first.")
-    print(f"\n{'='*64}\nINFER lt_s={args.lt_s} n_cycles={args.n_cycles} "
-          f"b={args.shortage_cost} demand=U({args.demand_low},{args.demand_high})\n"
-          f"checkpoint: {best}\n{'='*64}")
-    sm   = _build_sourcing_model(args.lt_s, args.n_cycles, args.shortage_cost,
-                                  args.expedited_cost, args.demand_low,
-                                  args.demand_high, args.batch_size)
+        raise FileNotFoundError(f"Checkpoint not found: {best!r}. Run training first.")
+
+    sm = _build_sourcing_model(
+        args.lt_s, args.n_cycles, args.shortage_cost,
+        demand_high=args.demand_high, expedited_cost=args.expedited_cost,
+        demand_low=args.demand_low, batch_size=args.batch_size,
+        init_inventory=args.init_inventory,
+    )
     ctrl = CyclicDualNeuralController.load_checkpoint(best, sm, device=args.device)
-    cs   = []
+
+    costs = []
     with torch.no_grad():
-        for seed in tqdm(range(EVAL_SEEDS), desc="Evaluating"):
-            cs.append(ctrl.get_average_cost(sm, EVAL_PERIODS, seed=seed))
-    mu  = torch.stack(cs).mean().item()
-    std = torch.stack(cs).std().item()
-    print(f"\n{'='*64}")
-    print(f"  NN mean cost : {mu:.4f}")
-    print(f"  NN std       : {std:.4f}")
+        for seed in tqdm(range(EVAL_SEEDS), desc=f"Evaluating policy (500 seeds)"):
+            costs.append(ctrl.get_average_cost(sm, EVAL_PERIODS, seed=seed))
+
+    mu = torch.stack(costs).mean().item()
+    std = torch.stack(costs).std().item()
+
+    print(f"\n{'=' * 60}")
+    print(f"Policy Evaluation (N={args.n_cycles}, l_s={args.lt_s}, b={args.shortage_cost}, D~U(0,{args.demand_high})):")
+    print(f"  Simulated Mean Cost : {mu:.4f}")
+    print(f"  Standard Deviation  : {std:.4f}")
     if args.vf is not None:
-        gap = (mu - args.vf) / args.vf * 100
-        print(f"  VF baseline  : {args.vf:.4f}")
-        print(f"  GAP%         : {gap:.4f}%")
-        logger.info("Infer: mean=%.4f std=%.4f VF=%.4f GAP=%.4f%%", mu, std, args.vf, gap)
-    else:
-        logger.info("Infer: mean=%.4f std=%.4f", mu, std)
-    print(f"{'='*64}\n")
+        gap = (mu - args.vf) / args.vf * 100.0
+        print(f"  VF Value     : {args.vf:.4f}")
+        print(f"  Optimality GAP      : {gap:.4f}%")
+    print(f"{'=' * 60}\n")
 
 
 def _parse_args():
-    p = argparse.ArgumentParser(description="HP grid search for CyclicDualNeuralController",
-                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--mode",           required=True, choices=["scan","full","infer"])
-    p.add_argument("--lt_s",           type=int,   required=True)
-    p.add_argument("--n_cycles",       type=int,   required=True)
-    p.add_argument("--shortage_cost",  type=int,   required=True)
-    p.add_argument("--expedited_cost", type=int,   default=20)
-    p.add_argument("--demand_low",     type=int,   default=0)
-    p.add_argument("--demand_high",    type=int,   default=4)
-    p.add_argument("--sourcing_periods", type=int, default=None,
-                   help="Auto-set from lt_s if omitted (100/150/200 for 2/3/4)")
-    p.add_argument("--epochs",         type=int,   default=800)
-    p.add_argument("--init_inventory_lr", type=float, default=1e-1)
-    p.add_argument("--batch_size",     type=int,   default=512)
-    p.add_argument("--seed",           type=int,   default=42)
-    p.add_argument("--n_seeds",        type=int,   default=1,
-                   help="Number of independent seeds to try; keep the best.")
-    p.add_argument("--parallel_seeds", type=int,   default=1,
-                   help=(
-                       "How many seeds to train concurrently using separate processes "
-                       "(all sharing the same GPU). Each process trains one seed. "
-                       "Recommended: 4-8 for H100. 1 = sequential (default)."
-                   ))
-    p.add_argument("--parameters_lr",  type=float, default=None)
-    p.add_argument("--hidden_layers",  type=str,   default=None,
-                   help='e.g. "128,64,32,16,8,4,2"')
-    p.add_argument("--base_checkpoint", type=str,  default=None)
-    p.add_argument("--checkpoint_dir",  type=str,  default="models/hp_grid/default")
-    p.add_argument("--vf",             type=float, default=None)
-    p.add_argument("--device",         type=str,   default="cpu", choices=["cpu","cuda"],
-                   help="HP logic is identical on cpu and cuda")
-    return p.parse_args()
+    p = argparse.ArgumentParser(
+        description="Neural Network Training and Transfer Learning for Cyclic Dual-Sourcing",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    # Primary minimal CLI arguments
+    p.add_argument("--mode", choices=["train", "infer", "scan", "full"], default="train",
+                   help="Operation mode: 'train' (training/transfer), 'infer' (evaluation), or 'scan'")
+    p.add_argument("--n_cycles", "-N", type=int, default=3, help="Replenishment cycle length N")
+    p.add_argument("--lt_s", "-l", type=int, required=True, help="Regular order lead time l_s")
+    p.add_argument("--shortage_cost", "-b", type=float, required=True, help="Unit shortage penalty b")
+    p.add_argument("--demand_high", "-d", type=int, default=4, help="Upper bound of uniform demand U(0, D_max)")
+    p.add_argument("--lr", type=float, default=None,
+                   help="Learning rate (default: 1e-3 for scratch training, 2e-4 for transfer fine-tuning)")
+    p.add_argument("--base_checkpoint", type=str, default=None,
+                   help="Path to pre-trained base model for transfer learning")
+    p.add_argument("--checkpoint_dir", type=str, default="models/default",
+                   help="Directory for saving and loading model checkpoints and logs")
+    p.add_argument("--device", type=str, default=DEFAULT_DEVICE, choices=["cpu", "cuda"],
+                   help="Computation device ('cuda' or 'cpu')")
+    p.add_argument("--vf", type=float, default=None,
+                   help="Certified DP value-function baseline (for GAP%% reporting)")
+
+    # Legacy/Extended options supported cleanly for backward compatibility
+    p.add_argument("--parameters_lr", type=float, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--epochs", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--patience", type=int, default=DEFAULT_PATIENCE, help=argparse.SUPPRESS)
+    p.add_argument("--hidden_layers", type=str, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--demand_low", type=int, default=DEMAND_LOW, help=argparse.SUPPRESS)
+    p.add_argument("--expedited_cost", type=float, default=EXPEDITED_COST, help=argparse.SUPPRESS)
+    p.add_argument("--batch_size", type=int, default=BATCH_SIZE, help=argparse.SUPPRESS)
+    p.add_argument("--init_inventory", type=float, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--init_inventory_lr", type=float, default=INIT_INVENTORY_LR, help=argparse.SUPPRESS)
+    p.add_argument("--sourcing_periods", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--seed", type=int, default=42, help=argparse.SUPPRESS)
+    p.add_argument("--n_seeds", type=int, default=1, help=argparse.SUPPRESS)
+    p.add_argument("--parallel_seeds", type=int, default=1, help=argparse.SUPPRESS)
+    p.add_argument("--use_scheduler", action="store_true", default=False, help=argparse.SUPPRESS)
+    p.add_argument("--vf_gap_tol", type=float, default=VF_GAP_TOL, help=argparse.SUPPRESS)
+    p.add_argument("--vf_patience", type=int, default=VF_PATIENCE, help=argparse.SUPPRESS)
+
+    args = p.parse_args()
+
+    # Synchronize alias arguments
+    if args.parameters_lr is not None and args.lr is None:
+        args.lr = args.parameters_lr
+
+    return args
 
 
 def main():
     args = _parse_args()
-    if args.device == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("--device cuda but CUDA not available. Use --device cpu.")
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-    else:
-        print("Device: CPU")
-    if args.mode == "scan":   run_scan(args)
-    elif args.mode == "full": run_full(args)
-    elif args.mode == "infer": run_infer(args)
+
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    run_log_path = os.path.join(args.checkpoint_dir, "train.log")
+    run_handler = logging.FileHandler(run_log_path, mode="w")
+    run_handler.setLevel(logging.INFO)
+    run_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+    logging.getLogger().addHandler(run_handler)
+
+    if args.device == "cuda" and not torch.cuda.is_available():
+        logger.warning("CUDA requested but not available. Falling back to CPU.")
+        args.device = "cpu"
+
+    if args.mode in ("train", "full"):
+        run_full(args)
+    elif args.mode == "infer":
+        run_infer(args)
+    elif args.mode == "scan":
+        run_scan(args)
+
 
 if __name__ == "__main__":
     main()
