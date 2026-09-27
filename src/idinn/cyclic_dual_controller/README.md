@@ -164,44 +164,27 @@ controller = CyclicDualNeuralController.load_checkpoint(
 
 ---
 
-## Seed Tuning CLI
+## Neural Network Training & Evaluation CLI
 
-`src/idinn/finetuning/pre_training.py` automates training and evaluation of `CyclicDualNeuralController` across multiple random seeds. **Run from the repository root.**
-
-```bash
-# Train a single model (seed=42) → saves to models/trained/finetuned_lt4_nc2_sc95_ec20_d0-4.pt
-python src/idinn/finetuning/pre_training.py --train
-
-# Train 10 models (seeds 0–9), evaluate each, keep the best
-python src/idinn/finetuning/pre_training.py --seed_train
-
-# Load finetuned_lt4_nc2_sc95_ec20_d0-4.pt and run inference over 100 seeds
-python src/idinn/finetuning/pre_training.py --infer
-```
-
-### Checkpoint layout
-
-```
-models/
-└── trained/
-    ├── best_model.pt          ← best model across all seeds (used by --infer)
-    └── seeded/
-        ├── model1.pt          ← seed 0
-        ├── model2.pt          ← seed 1
-        ├── ...
-        └── model10.pt         ← seed 9
-```
-
-### `--infer` prerequisite
-
-`--infer` loads `models/trained/best_model.pt`. This file must exist before running inference — create it with `--train` or `--seed_train` first:
+`src/idinn/finetuning/hp_grid_search.py` provides an end-to-end command-line interface for training, transfer fine-tuning, and evaluating `CyclicDualNeuralController`.
 
 ```bash
-python src/idinn/finetuning/pre_training.py --train   # or --seed_train
-python src/idinn/finetuning/pre_training.py --infer
-```
+# 1. Train base model from scratch:
+python src/idinn/finetuning/hp_grid_search.py \
+    --mode train --n_cycles 3 --lt_s 2 --shortage_cost 95 --demand_high 4 \
+    --checkpoint_dir models/base_c3_ls2_b95
 
-Training logs are written to `src/idinn/finetuning/tune_cyclic_neural.log`.
+# 2. Transfer fine-tuning (lead-time expansion):
+python src/idinn/finetuning/hp_grid_search.py \
+    --mode train --n_cycles 3 --lt_s 3 --shortage_cost 95 --demand_high 4 \
+    --lr 0.0002 --base_checkpoint models/base_c3_ls2_b95 \
+    --checkpoint_dir models/transfer_c3_ls3_b95
+
+# 3. Policy evaluation & GAP% computation over 500 test seeds:
+python src/idinn/finetuning/hp_grid_search.py \
+    --mode infer --n_cycles 3 --lt_s 3 --shortage_cost 95 --demand_high 4 \
+    --vf 106.0125 --checkpoint_dir models/transfer_c3_ls3_b95
+```
 
 ---
 

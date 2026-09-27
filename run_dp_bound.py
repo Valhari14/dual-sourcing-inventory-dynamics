@@ -1,22 +1,16 @@
 """
 run_dp_bound.py
 
-Runs the cycle-unrolled DP dual-sourcing controller (either the vanilla
-serial implementation in dp_bound.py, or the parallel one in
-dp_bound_parallel.py) for a single parameter combination and saves results
-to a JSON file.
+Runs the cycle-unrolled dynamic programming dual-sourcing controller (Problem II)
+for a parameter set and saves the certified optimal value function (VF) to JSON.
 
-Use --controller to pick which implementation runs. Run the SAME
-parameters through both --controller serial and --controller parallel to
-validate the parallel version before trusting it for a full sweep.
-
-Checkpointing (parallel controller only): pass --checkpoint_path to save
-the value function periodically during the sweep. If the process
-receives SIGTERM (e.g. from Slurm's --signal warning before a time-limit
-kill), it saves a checkpoint and exits with code 75 instead of writing an
-incomplete output JSON. Re-running the same command will resume from
-that checkpoint rather than starting over. On successful convergence the
-checkpoint file is deleted automatically.
+Usage:
+    python run_dp_bound.py \
+        --cycle_length 2 \
+        --regular_lead_time 2 \
+        --backlog_cost 495 \
+        --demand_max 4 \
+        --output_path results/problem2_dp_bound.json
 """
 
 import argparse
@@ -28,66 +22,43 @@ import sys
 import time
 from datetime import datetime
 
+# Ensure project root is on sys.path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# -----------------------------------------------------------------------------
+# Dual-Sourcing Benchmark Constants (Problem II)
+# -----------------------------------------------------------------------------
+HOLDING_COST = 5.0
+EXPEDITED_ORDER_COST = 20.0
+REGULAR_ORDER_COST = 0.0
+EXPEDITED_LEAD_TIME = 0
+DEMAND_MIN = 0
+TOLERANCE = 1e-7
+MAX_ITERATIONS = 1_000_000
+VALIDATION_FREQ = 100
+LOG_FREQ = 100
+SOURCING_PERIODS = 1000
+SEED = 42
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
 
-INTERRUPTED_EXIT_CODE = 75
-
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run DP dual-sourcing (dp_bound) experiment")
-
-    parser.add_argument(
-        "--controller", choices=["serial", "parallel"], default="parallel",
-        help="serial -> dp_bound.DynamicProgrammingController (vanilla), "
-             "parallel -> dp_bound_parallel.DynamicProgrammingController",
+    parser = argparse.ArgumentParser(
+        description="Run cyclic dual-sourcing dynamic programming (Problem II)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-
-    # Model parameters
-    parser.add_argument("--cycle_length", type=int, default=2)
-    parser.add_argument("--backlog_cost", type=float, default=495.0)
-    parser.add_argument("--holding_cost", type=float, default=5.0)
-    parser.add_argument("--expedited_order_cost", type=float, default=20.0)
-    parser.add_argument("--regular_lead_time", type=int, default=2)
-    parser.add_argument("--expedited_lead_time", type=int, default=0)
-    parser.add_argument("--regular_order_cost", type=float, default=0.0)
-    parser.add_argument("--demand_min", type=int, default=0)
-    parser.add_argument("--demand_max", type=int, default=4)
-
-    # DP parameters
-    parser.add_argument("--max_iterations", type=int, default=1_000_000)
-    parser.add_argument("--tolerance", type=float, default=1e-7)
-    parser.add_argument("--validation_freq", type=int, default=100)
-    parser.add_argument("--log_freq", type=int, default=100)
-    parser.add_argument(
-        "--bound_slack", type=int, default=1,
-        help="1 = base signed IP box, 2 = widened box for truncation-sensitivity re-run "
-             "(matching values between 1 and 2 certify the truncation is non-binding).",
-    )
-
-    # Checkpointing (parallel controller only)
-    parser.add_argument(
-        "--checkpoint_path", type=str, default=None,
-        help="Path to save/resume the value-function checkpoint (parallel controller only). "
-             "If not given but --output_path is, a default is derived automatically.",
-    )
-    parser.add_argument("--checkpoint_freq", type=int, default=200)
-
-    # Evaluation parameters
-    parser.add_argument("--sourcing_periods", type=int, default=1000)
-    parser.add_argument("--seed", type=int, default=42)
-
-    # Output
-    parser.add_argument("--output_path", type=str, default="results/dp_bound/dp_result.json")
-    parser.add_argument(
-        "--save_qf", action="store_true",
-        help="Also pickle the full qf policy dict + vf alongside output_path "
-             "(needed to diff serial vs parallel state-by-state, not just the vf scalar).",
-    )
-
+    parser.add_argument("--cycle_length", type=int, default=2, help="Replenishment cycle length N")
+    parser.add_argument("--regular_lead_time", type=int, default=2, help="Regular lead time l_s")
+    parser.add_argument("--backlog_cost", type=float, default=495.0, help="Unit shortage penalty b")
+    parser.add_argument("--demand_max", type=int, default=4, help="Upper bound for uniform demand U(0, d_max)")
+    parser.add_argument("--controller", choices=["parallel", "serial"], default="parallel", help="DP solver engine")
+    parser.add_argument("--output_path", type=str, default="results/dp_bound/dp_result.json", help="Path to save results")
+    parser.add_argument("--save_qf", action="store_true", help="Save full Q-factor policy dictionary")
     return parser.parse_args()
 
 
@@ -95,34 +66,32 @@ def main():
     args = parse_args()
 
     logger.info("=" * 60)
-    logger.info("Experiment parameters:")
-    for k, v in vars(args).items():
-        logger.info(f"  {k}: {v}")
+    logger.info("Problem II DP Bound Parameters:")
+    logger.info("  Cycle Length (N)   : %d", args.cycle_length)
+    logger.info("  Regular Lead Time  : %d", args.regular_lead_time)
+    logger.info("  Backlog Penalty (b): %.1f", args.backlog_cost)
+    logger.info("  Demand             : U(%d, %d)", DEMAND_MIN, args.demand_max)
+    logger.info("  Controller Engine  : %s", args.controller)
     logger.info("=" * 60)
 
-    from idinn.demand import UniformDemand
-    from idinn.sourcing_model import DualSourcingModel
+    from src.idinn.demand import UniformDemand
+    from src.idinn.sourcing_model import DualSourcingModel
 
     if args.controller == "serial":
-        from idinn.dual_controller.dp_bound import DynamicProgrammingController
+        from src.idinn.cyclic_dual_controller.dp_bound import DynamicProgrammingController
     else:
-        from idinn.dual_controller.dp_bound_parallel import DynamicProgrammingController
+        from src.idinn.cyclic_dual_controller.dp_bound_parallel import DynamicProgrammingController
 
-    os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
 
-    checkpoint_path = args.checkpoint_path
-    if checkpoint_path is None and args.controller == "parallel":
-        checkpoint_path = args.output_path.replace(".json", "_ckpt.npz")
-
-    demand = UniformDemand(low=args.demand_min, high=args.demand_max)
-
+    demand = UniformDemand(low=DEMAND_MIN, high=args.demand_max)
     model = DualSourcingModel(
         demand_generator=demand,
         regular_lead_time=args.regular_lead_time,
-        expedited_lead_time=args.expedited_lead_time,
-        regular_order_cost=args.regular_order_cost,
-        expedited_order_cost=args.expedited_order_cost,
-        holding_cost=args.holding_cost,
+        expedited_lead_time=EXPEDITED_LEAD_TIME,
+        regular_order_cost=REGULAR_ORDER_COST,
+        expedited_order_cost=EXPEDITED_ORDER_COST,
+        holding_cost=HOLDING_COST,
         shortage_cost=args.backlog_cost,
         init_inventory=0,
         batch_size=1,
@@ -130,65 +99,55 @@ def main():
 
     controller = DynamicProgrammingController(cycle_length=args.cycle_length)
 
-    logger.info(f"Starting DP fit ({args.controller})...")
+    logger.info("Fitting dynamic programming value function...")
     t0 = time.time()
-
-    fit_kwargs = dict(
+    controller.fit(
         sourcing_model=model,
-        max_iterations=args.max_iterations,
-        tolerance=args.tolerance,
-        validation_freq=args.validation_freq,
-        log_freq=args.log_freq,
-        bound_slack=args.bound_slack,
+        max_iterations=MAX_ITERATIONS,
+        tolerance=TOLERANCE,
+        validation_freq=VALIDATION_FREQ,
+        log_freq=LOG_FREQ,
+        bound_slack=1,
     )
-    if args.controller == "parallel":
-        fit_kwargs["checkpoint_path"] = checkpoint_path
-        fit_kwargs["checkpoint_freq"] = args.checkpoint_freq
-
-    controller.fit(**fit_kwargs)
-
     fit_duration = time.time() - t0
+    logger.info("DP fit completed in %.1fs (%.2fh)", fit_duration, fit_duration / 3600.0)
 
-    if getattr(controller, "interrupted", False):
-        logger.warning(
-            f"Fit was interrupted before convergence after {fit_duration:.1f}s "
-            f"-- checkpoint saved to {checkpoint_path}. No output JSON written. "
-            f"Re-run the same command to resume."
-        )
-        sys.exit(INTERRUPTED_EXIT_CODE)
-
-    logger.info(f"DP fit completed in {fit_duration:.1f}s ({fit_duration/3600:.2f}h)")
-
-    logger.info("Evaluating average cost...")
+    # Evaluate simulated average cost under optimal policy
     avg_cost = controller.get_average_cost(
         sourcing_model=model,
-        sourcing_periods=args.sourcing_periods,
-        seed=args.seed,
+        sourcing_periods=SOURCING_PERIODS,
+        seed=SEED,
     )
     avg_cost_val = avg_cost.detach().item()
-    logger.info(f"Average cost per period: {avg_cost_val:.4f}")
+    logger.info("Simulated average cost per period: %.4f", avg_cost_val)
 
     results = {
         "timestamp": datetime.now().isoformat(),
         "controller": args.controller,
-        "parameters": vars(args),
+        "parameters": {
+            "cycle_length": args.cycle_length,
+            "regular_lead_time": args.regular_lead_time,
+            "backlog_cost": args.backlog_cost,
+            "holding_cost": HOLDING_COST,
+            "expedited_order_cost": EXPEDITED_ORDER_COST,
+            "demand_min": DEMAND_MIN,
+            "demand_max": args.demand_max,
+        },
         "vf_value": controller.vf,
         "average_cost": avg_cost_val,
         "fit_duration_seconds": fit_duration,
         "num_states": len(controller.qf) if controller.qf else None,
     }
 
-    with open(args.output_path, "w") as f:
+    with open(args.output_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
-    logger.info(f"Results saved to {args.output_path}")
+    logger.info("Results saved to %s", args.output_path)
 
     if args.save_qf:
         qf_path = args.output_path.replace(".json", "_qf.pkl")
         with open(qf_path, "wb") as f:
             pickle.dump({"qf": controller.qf, "vf": controller.vf}, f)
-        logger.info(f"Policy (qf) saved to {qf_path}")
-
-    logger.info("Done.")
+        logger.info("Policy (qf) saved to %s", qf_path)
 
 
 if __name__ == "__main__":
